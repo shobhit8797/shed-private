@@ -33,11 +33,15 @@ function writeUrl(url) {
 const cloudflared = findCloudflared();
 const quickUrl = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/gi;
 let child = null, relayKey = '', stopping = false;
+// Written by the server (Settings → Phone access). While phones connect through Tailscale, the public link stays off.
+const accessFile = path.join(dataDir, 'phone-access');
+const tailscaleChosen = () => { try { return fs.readFileSync(accessFile, 'utf8').trim() === 'tailscale'; } catch { return false; } };
 
 function start() {
   const relay = readRelay();
   relayKey = relay ? `${relay.hostname}|${relay.token}` : '';
   fs.rmSync(urlFile, { force:true });
+  if (tailscaleChosen()) { child = null; console.log('Phones connect through Tailscale, so the Cloudflare link is off.'); return; }
   // The relay token goes through the environment, not argv, so it does not show up in `ps`.
   child = relay
     ? spawn(cloudflared, ['tunnel', '--no-autoupdate', 'run'], { cwd:root, env:{ ...process.env, TUNNEL_TOKEN:relay.token }, stdio:['ignore', 'pipe', 'pipe'] })
@@ -49,6 +53,8 @@ function start() {
     if (relay && /Registered tunnel connection/i.test(value)) writeUrl(`https://${relay.hostname}`);
     const matches = !relay && value.match(quickUrl);
     if (matches?.length) writeUrl(matches.at(-1));
+    // Cloudflare can drop a Quick Tunnel; cloudflared then retries the dead one forever. Exit so launchd starts a new one.
+    if (!relay && /Tunnel not found/i.test(value)) { fs.rmSync(urlFile, { force:true }); current.kill('SIGTERM'); }
   };
   current.stdout.on('data', readOutput);
   current.stderr.on('data', readOutput);
@@ -59,14 +65,24 @@ function start() {
     if (!stopping) process.exit(code || 1); // launchd starts it again
   });
 }
-// Turning Pro on or off swaps the tunnel without restarting the whole service.
-fs.watchFile(relayFile, { interval:3000 }, () => {
-  const relay = readRelay();
-  if ((relay ? `${relay.hostname}|${relay.token}` : '') === relayKey) return;
+function restart() {
   const old = child;
   child = null;
   old?.kill('SIGTERM');
   start();
+}
+// Turning Pro on or off swaps the tunnel without restarting the whole service.
+fs.watchFile(relayFile, { interval:3000 }, () => {
+  const relay = readRelay();
+  if ((relay ? `${relay.hostname}|${relay.token}` : '') === relayKey) return;
+  restart();
+});
+// Choosing Tailscale or Cloudflare in Settings → Phone access stops or starts the public link.
+let chosen = tailscaleChosen();
+fs.watchFile(accessFile, { interval:3000 }, () => {
+  if (tailscaleChosen() === chosen) return;
+  chosen = tailscaleChosen();
+  restart();
 });
 start();
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { stopping = true; child?.kill(signal); process.exit(0); });
