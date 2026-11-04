@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 // Critic: a second agent that questions the judgment of the agent doing a task. The critic is a named agent ("critic",
 // one per project, read-only). During a task the worker may ask it with `shed ask critic`. After a worker's Shed task
@@ -9,6 +10,7 @@ export const CRITIC_NAME = 'critic';
 export const MAX_ROUNDS = 5;
 export const DIFF_LIMIT = 30000;
 const FRESH_WINDOW_MS = 600000; // A task that finished longer ago than this is never reviewed (so turning the critic on skips old tasks).
+export const ANSWER_LIMIT_MS = 3600000; // A step with no answer after this ends the chain, so the worker can sleep and get later reviews.
 
 export function prefs(saved = {}) {
   const rounds = Math.round(Number(saved.rounds ?? 2));
@@ -20,22 +22,28 @@ export const criticHarness = (saved, workerHarness) => { const p = prefs(saved);
 // "No concerns." is the only answer that ends a review early.
 export const noConcerns = reply => /^no concerns\.?$/i.test(String(reply || '').trim());
 
-const git = (cwd, args) => { try { return execFileSync('git', ['-C', cwd, ...args], { encoding:'utf8', maxBuffer:50e6, timeout:15000, stdio:['ignore', 'pipe', 'ignore'] }); } catch { return null; } };
-// The project's uncommitted changes, or '' when it is not a git repository.
-export function changes(cwd) {
-  if (git(cwd, ['rev-parse', '--is-inside-work-tree'])?.trim() !== 'true') return '';
-  const stat = git(cwd, ['diff', 'HEAD', '--stat']) ?? git(cwd, ['diff', '--stat']) ?? '';
-  const diff = git(cwd, ['diff', 'HEAD']) ?? git(cwd, ['diff']) ?? '';
-  return `\n\ngit diff --stat:\n${stat.trim() || '(no changes)'}\n\ngit diff${diff.length > DIFF_LIMIT ? ` (cut at ${DIFF_LIMIT} of ${diff.length} characters)` : ''}:\n${diff.slice(0, DIFF_LIMIT) || '(no changes)'}`;
+// Async so a large repository does not stop the server. The repository's own config must not run a command during a
+// review, so fsmonitor, external diff tools and textconv are off.
+const run = promisify(execFile);
+const git = (cwd, args) => run('git', ['-C', cwd, '-c', 'core.fsmonitor=false', ...args], { encoding:'utf8', maxBuffer:50e6, timeout:15000 }).then(r => r.stdout, () => null);
+const DIFF = ['diff', '--no-ext-diff', '--no-textconv'];
+// The project's uncommitted changes and new files, or '' when it is not a git repository.
+export async function changes(cwd) {
+  if ((await git(cwd, ['rev-parse', '--is-inside-work-tree']))?.trim() !== 'true') return '';
+  const stat = (await git(cwd, [...DIFF, 'HEAD', '--stat'])) ?? (await git(cwd, [...DIFF, '--stat'])) ?? '';
+  const diff = (await git(cwd, [...DIFF, 'HEAD'])) ?? (await git(cwd, DIFF)) ?? '';
+  // git diff leaves out untracked files, so a task that only added files would look like no work.
+  const added = ((await git(cwd, ['ls-files', '--others', '--exclude-standard'])) ?? '').trim();
+  return `\n\ngit diff --stat:\n${stat.trim() || '(no changes)'}${added ? `\n\nNew files, not in git diff (read them yourself):\n${added.slice(0, 4000)}` : ''}\n\ngit diff${diff.length > DIFF_LIMIT ? ` (cut at ${DIFF_LIMIT} of ${diff.length} characters)` : ''}:\n${diff.slice(0, DIFF_LIMIT) || '(no changes)'}`;
 }
 
 // Read by agents: Simplified Technical English.
-export function reviewRequest({ prompt, reply, cwd, round, max }) {
+export async function reviewRequest({ prompt, reply, cwd, round, max }) {
   return [
     `Review round ${round} of ${max}. Review the work of the agent that sent this message.`,
     `Task prompt:\n${String(prompt).trim().slice(0, 4000)}`,
     `The agent's final reply:\n${String(reply || '(no reply)').trim().slice(-6000)}`,
-    `${changes(cwd).trim() || 'This project is not a git repository, so there is no diff.'}`,
+    `${(await changes(cwd)).trim() || 'This project is not a git repository, so there is no diff.'}`,
     'Question its decisions on architecture and implementation. Do not edit files.',
     'Answer with a numbered list of concerns. If you have no concerns, answer with exactly: No concerns.',
   ].join('\n\n');
@@ -77,7 +85,7 @@ export function criticEngine({ dataDir, settings, agents, tasks, sessions, excha
     const own = agents.forSession(worker);
     if (own?.name === CRITIC_NAME || !worker.cwd) return null;
     let agent = agents.all().find(a => a.cwd === worker.cwd && a.name === CRITIC_NAME);
-    agent ||= agents.create({ name:CRITIC_NAME, cwd:worker.cwd, harness:criticHarness(settings(), worker.harness) });
+    agent ||= agents.create({ name:CRITIC_NAME, cwd:worker.cwd, harness:criticHarness(settings().critic, worker.harness) });
     if (!agent.enabled) return null;
     const session = sessions().find(s => agents.forSession(s)?.id === agent.id);
     return session ? { ...session, liveState:'open', agent }
@@ -89,13 +97,16 @@ export function criticEngine({ dataDir, settings, agents, tasks, sessions, excha
   async function review(chain, worker, reply) {
     const critic = target(worker);
     if (!critic) return finish(chain, 'no critic');
-    const { exchange } = await send({ kind:'review', from:worker, to:critic, message:reviewRequest({ prompt:chain.prompt, reply, cwd:chain.cwd, round:chain.round, max:chain.max }), title:`review ${chain.round}/${chain.max}` });
+    const { exchange } = await send({ kind:'review', from:worker, to:critic, message:await reviewRequest({ prompt:chain.prompt, reply, cwd:chain.cwd, round:chain.round, max:chain.max }), title:`review ${chain.round}/${chain.max}` });
     Object.assign(chain, { phase:'review', exchangeId:exchange.id }); persist();
   }
   async function advance(chain) {
     const x = exchanges.get(chain.exchangeId);
     if (!x || x.status === 'failed') return finish(chain, x?.error || 'exchange lost');
-    if (x.status !== 'answered') return;
+    if (x.status !== 'answered') {
+      if (Date.now() - Date.parse(x.createdAt) > ANSWER_LIMIT_MS) finish(chain, 'no answer in an hour');
+      return;
+    }
     const worker = sessions().find(s => s.id === chain.worker);
     if (!worker) return finish(chain, 'worker gone');
     if (chain.phase === 'review') {

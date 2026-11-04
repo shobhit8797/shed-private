@@ -8,6 +8,8 @@ import { probe } from './health.js';
 // { id:'<harness>:<name>', harness, name, configDir, alias }. "<harness>:default" is the normal folder.
 export const ACCOUNT_HARNESSES = { claude:{ env:'CLAUDE_CONFIG_DIR', folder:'.claude', sessions:'projects' }, codex:{ env:'CODEX_HOME', folder:'.codex', sessions:'sessions' } };
 export const ACCOUNT_NAME = /^[a-z0-9-]{1,30}$/;
+// Own keys only: "constructor" or "__proto__" must not pass as a harness.
+const isHarness = harness => typeof harness === 'string' && Object.hasOwn(ACCOUNT_HARNESSES, harness);
 
 // The root is configurable so tests never touch ~/.shed.
 export const accountsRoot = () => process.env.SHED_ACCOUNTS_DIR || path.join(os.homedir(), '.shed', 'accounts');
@@ -21,7 +23,8 @@ function defaultAccount(harness) {
 function addedAccounts() {
   let rows = [];
   try { rows = JSON.parse(fs.readFileSync(registryFile(), 'utf8')); } catch { return []; }
-  return rows.filter(r => ACCOUNT_HARNESSES[r?.harness] && ACCOUNT_NAME.test(r.name) && r.name !== 'default')
+  if (!Array.isArray(rows)) return [];
+  return rows.filter(r => isHarness(r?.harness) && typeof r.name === 'string' && ACCOUNT_NAME.test(r.name) && r.name !== 'default')
     .map(r => withAlias({ id:`${r.harness}:${r.name}`, harness:r.harness, name:r.name, configDir:path.join(accountsRoot(), r.harness, r.name) }));
 }
 
@@ -34,7 +37,7 @@ export const accountFor = (harness, id) => { const a = id && getAccount(id); ret
 export const accountEnv = account => account && account.name !== 'default' ? { [ACCOUNT_HARNESSES[account.harness].env]:account.configDir } : {};
 
 export function addAccount({ harness, name }) {
-  if (!ACCOUNT_HARNESSES[harness]) throw new Error('Accounts are for Claude Code or Codex. Choose one of them.');
+  if (!isHarness(harness)) throw new Error('Accounts are for Claude Code or Codex. Choose one of them.');
   if (typeof name !== 'string' || !ACCOUNT_NAME.test(name)) throw new Error('Account names must be 1–30 lowercase letters, numbers, or dashes.');
   if (name === 'default') throw new Error('The name "default" is for the normal account. Choose another name.');
   const account = withAlias({ id:`${harness}:${name}`, harness, name, configDir:path.join(accountsRoot(), harness, name) });

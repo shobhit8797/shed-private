@@ -65,6 +65,18 @@ test('aliases file lists each added account; the zshrc line is added once', () =
   assert.doesNotMatch(fs.readFileSync(accounts.aliasesFile(), 'utf8'), /claude-work/);
 });
 
+test('prototype keys are not harnesses, and a bad registry reads as no added accounts', () => {
+  for (const harness of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) assert.throws(() => accounts.addAccount({ harness, name:'x' }), /Claude Code or Codex/);
+  const file = path.join(root, 'accounts.json'), saved = fs.readFileSync(file, 'utf8');
+  const ids = () => accounts.listAccounts().map(a => a.id);
+  try {
+    fs.writeFileSync(file, JSON.stringify([{ harness:'constructor', name:'x' }, { harness:'claude' }]));
+    assert.deepEqual(ids(), ['claude:default', 'codex:default'], 'a saved prototype key or a missing name is skipped');
+    fs.writeFileSync(file, '{"harness":"claude","name":"x"}');
+    assert.deepEqual(ids(), ['claude:default', 'codex:default'], 'a registry that is not a list does not throw');
+  } finally { fs.writeFileSync(file, saved); }
+});
+
 test('aliases under the home folder use $HOME', () => {
   const dir = path.join(os.homedir(), '.shed', 'accounts', 'claude', 'work');
   assert.match(accounts.aliasesText([{ harness:'claude', alias:'claude-work', configDir:dir }]), /alias claude-work='CLAUDE_CONFIG_DIR="\$HOME\/\.shed\/accounts\/claude\/work" claude'/);

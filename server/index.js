@@ -24,7 +24,7 @@ import { parseMenu, keysToChoose } from './menu.js';
 import { extractUrl, fetchShared, sharePrompt, signedShortcut } from './share.js';
 import { agentStore, agentState, launchArgs, memoryFile, AGENT_HARNESSES, AGENT_NAME, SLEEP_AFTER_MS } from './agents.js';
 import { accountStatus, getAccount, accountFor, accountEnv, addAccount, removeAccount, addToZshrc, forgetLoginState, sourceLine, inZshrc } from './accounts.js';
-import { criticEngine, launchExtras, prefs as criticPrefs, enabledFor as criticEnabledFor, workerNote, MAX_ROUNDS } from './critic.js';
+import { criticEngine, launchExtras, prefs as criticPrefs, enabledFor as criticEnabledFor, workerNote, MAX_ROUNDS, CRITIC_NAME } from './critic.js';
 import { tailscaleStatus, publish as publishTailscale, unpublish as unpublishTailscale } from './tailscale.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -136,9 +136,13 @@ function isDirectLocal(req) {
   return LOOPBACK.includes(req.socket.remoteAddress) && LOCAL_HOST.test(String(req.headers.host || '')) && !PROXY_HEADERS.some(h => req.headers[h] !== undefined);
 }
 // The visitor's real address: cloudflared connects locally and reports the original one in CF-Connecting-IP.
+// Tailscale Serve also connects locally and appends the visitor's address to X-Forwarded-For. Only the last entry
+// comes from the proxy, so a forged earlier entry is ignored. Without this every tailnet phone reads as 127.0.0.1.
 function clientIp(req) {
-  if (LOOPBACK.includes(req.socket.remoteAddress) && typeof req.headers['cf-connecting-ip'] === 'string') return req.headers['cf-connecting-ip'].slice(0, 64);
-  return req.socket.remoteAddress || 'unknown';
+  if (!LOOPBACK.includes(req.socket.remoteAddress)) return req.socket.remoteAddress || 'unknown';
+  if (typeof req.headers['cf-connecting-ip'] === 'string') return req.headers['cf-connecting-ip'].slice(0, 64);
+  const forwarded = typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'].split(',').pop().trim() : '';
+  return forwarded ? forwarded.slice(0, 64) : req.socket.remoteAddress;
 }
 function isLocalRequest(req) {
   if (!isDirectLocal(req)) return false;
@@ -334,7 +338,7 @@ async function watchAndNotify() {
     for (const task of tasks) {
       // A task created since the last check counts as running, so one that finishes within a single interval still notifies.
       const before = seen.tasks.get(task.id) ?? (Date.parse(task.createdAt) >= seen.at ? 'running' : undefined);
-      if (!['running', 'queued'].includes(before) || !['completed', 'failed'].includes(task.status) || !prefs.finished || task.exchangeKind === 'ask') continue;
+      if (!['running', 'queued'].includes(before) || !['completed', 'failed'].includes(task.status) || !prefs.finished || task.exchangeKind) continue; // An ask or a critic round is not news.
       const done = task.status === 'completed';
       notify({ title:`${label[task.harness] || task.harness} ${done ? 'finished' : 'stopped'}: ${task.title}`, body:done ? firstLine(task.output) || 'Tap to see the reply.' : firstLine(task.error) || 'Tap to see what happened.', url:`/?task=${encodeURIComponent(task.id)}`, tag:`task-${task.id}` }).catch(() => {});
     }
@@ -859,7 +863,7 @@ function startTask(input, route, modelDecision, requestedCwd = '', agent = agent
   // Attached files move into the project, and the agent is told where they are.
   const attachments = [...(input.attachmentPaths || []), ...uploads.place(input.attachments || [], cwd === root ? '' : cwd)];
   agentPrompt += attachmentNote(attachments);
-  if (!agent && !input.noCritic && criticEnabledFor(settings.critic)) agentPrompt += `\n\n${workerNote(shedCli)}`; // A plain session has no standing instructions, so the note rides with the message.
+  if (!agent && !input.noCritic && TALKERS.includes(harness) && criticEnabledFor(settings.critic)) agentPrompt += `\n\n${workerNote(shedCli)}`; // A plain session has no standing instructions, so the note rides with the message.
   const task = {
     id: crypto.randomUUID(), prompt: input.prompt.trim(), title: titleFor(input.prompt),
     status: 'running', harness, sessionId: route.session?.id || null,
@@ -1273,6 +1277,9 @@ const server = http.createServer(async (req, res) => {
       const account = accountAction && getAccount(decodeURIComponent(accountAction[1]));
       if (!account) return send(res, 404, { error:'Account not found.' });
       if (accountAction[2] === 'login') return send(res, 200, { tty:await openAccountLogin(account) });
+      // An agent on a removed account would silently continue under the default login, in an empty conversation.
+      const user = agents.all().find(a => a.account === account.id);
+      if (user) return send(res, 409, { error:`The agent ${user.name} uses this account. Delete that agent first.` });
       try { removeAccount(account.id); } catch (error) { return send(res, 400, { error:error.message }); }
       broadcast('sessions', {});
       return send(res, 200, { ok:true });
@@ -1440,6 +1447,7 @@ const server = http.createServer(async (req, res) => {
         input = session ? { ...input, sessionId:session.id, newSession:false, followup:'stay' } : { ...input, sessionId:null, newSession:true, harness:agent.harness, cwd:agent.cwd, newWorkspace:'' };
       } else if (agentName) {
         if (!AGENT_NAME.test(agentName)) return send(res, 400, { error:'Agent names must be 1–40 lowercase letters, numbers, or dashes, and start with a letter or number.' });
+        if (agentName === CRITIC_NAME) return send(res, 400, { error:'The name "critic" is for the critic agent. Choose another name.' });
         const ready = AGENT_HARNESSES.filter(h => available[h] && harnessHealth()?.[h]?.state === 'ready');
         input = { ...input, sessionId:null, newSession:true, harness:AGENT_HARNESSES.includes(input.harness) ? input.harness : ready[0] || 'claude' };
       }
@@ -1454,11 +1462,16 @@ const server = http.createServer(async (req, res) => {
       input = planned;
       if (route.session?.liveState === 'working' && !['codex', 'claude'].includes(route.session.harness)) return send(res, 409, { error: 'This desktop session is still working. Wait for it to finish before sending a follow-up.' });
       if (route.session && [...active.values()].some(child => child.layaSessionId === route.session.id)) return send(res, 409, { error: 'This session is already running a task.' });
-      if (agentName) agent = agents.create({ name:agentName, cwd, harness:route.harness, account:accountFor(route.harness, input.account).id });
-      else if (!agent) agent = agents.forSession(route.session);
+      let made = null;
+      if (agentName) {
+        try { agent = made = agents.create({ name:agentName, cwd, harness:route.harness, account:accountFor(route.harness, input.account).id }); }
+        catch (error) { return send(res, 409, { error:error.message }); }
+      } else if (!agent) agent = agents.forSession(route.session);
       if (route.handoffFrom) agent = null; // A handoff starts a new session in another harness; the agent stays where it was.
       if (agent && !agent.enabled) return send(res, 409, { error:`The agent ${agent.name} is turned off. Turn it on under Settings → Agents.` });
-      const task = startTask(input, route, model, cwd, agent);
+      let task;
+      // An agent made for a task that did not start would block a retry with the same name.
+      try { task = startTask(input, route, model, cwd, agent); } catch (error) { if (made) agents.remove(made.id); throw error; }
       if (route.session && active.has(task.id)) active.get(task.id).layaSessionId = route.session.id;
       return send(res, 201, { task });
     }
@@ -1498,7 +1511,11 @@ server.listen(port, host, () => {
   refreshHarnessHealth().catch(error => console.error(`Harness health check failed: ${error.message}`));
   setInterval(() => refreshHarnessHealth().catch(error => console.error(`Harness health check failed: ${error.message}`)), 60000).unref();
   watchAndNotify();
-  setInterval(() => { sessions(true); watchAndNotify(); critic.sweep(); sleepIdleAgents().catch(error => console.error(`Agent sleep failed: ${error.message}`)); }, 10000).unref();
+  setInterval(() => {
+    // One bad transcript or registry must not stop the server: an uncaught throw here ends the process.
+    try { sessions(true); watchAndNotify(); } catch (error) { console.error(`Session refresh failed: ${error.message}`); }
+    critic.sweep().catch(error => console.error(`Critic failed: ${error.message}`));
+    sleepIdleAgents().catch(error => console.error(`Agent sleep failed: ${error.message}`)); }, 10000).unref();
   refreshTailscale().then(ts => { if (phoneAccess() === 'tailscale') console.log(ts.url ? `Phones connect through Tailscale: ${ts.url}` : `Tailscale is chosen for phones, but: ${ts.problem}`); });
   setInterval(() => refreshTailscale(), 60000).unref();
   pro.check();

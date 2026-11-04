@@ -38,6 +38,7 @@ Phones can reach Shed through Tailscale instead of the Cloudflare link. Choose *
 - **Stable address:** the address does not change, so the Home Screen app and its notifications keep working.
 - **Requirements:** Tailscale signed in on the Mac and the phone (same tailnet), MagicDNS and HTTPS Certificates turned on in the Tailscale admin console. Shed refuses a port that already serves something else, or one with Funnel on.
 - **Sign-in still applies:** requests through Tailscale Serve never count as "on the Mac", so the password and device approval apply as they do for the Cloudflare link.
+- **One Shed per Mac name:** browsers send a cookie to every port of a host. Any other service that you publish with `tailscale serve` on the same `<mac>.<tailnet>.ts.net` name receives Shed's sign-in cookie. Do not publish a service you do not trust on that name.
 
 ## Open it
 

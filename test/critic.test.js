@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { criticEngine, prefs, enabledFor, criticHarness, noConcerns, reviewRequest, launchExtras, DIFF_LIMIT } from '../server/critic.js';
+import { criticEngine, prefs, enabledFor, criticHarness, noConcerns, reviewRequest, launchExtras, DIFF_LIMIT, ANSWER_LIMIT_MS } from '../server/critic.js';
 import { agentStore, launchArgs } from '../server/agents.js';
 import { exchangeStore } from '../server/exchanges.js';
 
@@ -126,18 +126,37 @@ test('old tasks and tasks of exchanges are not reviewed', async () => {
   assert.equal(r.sent.length, 0);
 });
 
-test('review request carries a size-limited diff in a git repository only', () => {
+test('review request carries a size-limited diff in a git repository only', async () => {
   const dir = tmp();
-  assert.match(reviewRequest({ prompt:'p', reply:'r', cwd:dir, round:1, max:2 }), /not a git repository/);
+  assert.match(await reviewRequest({ prompt:'p', reply:'r', cwd:dir, round:1, max:2 }), /not a git repository/);
   execFileSync('git', ['-C', dir, 'init', '-q']);
   fs.writeFileSync(path.join(dir, 'a.txt'), 'one\n');
   execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.']);
   execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x']);
   fs.writeFileSync(path.join(dir, 'a.txt'), 'x'.repeat(DIFF_LIMIT * 2));
-  const text = reviewRequest({ prompt:'p', reply:'r', cwd:dir, round:1, max:2 });
+  const text = await reviewRequest({ prompt:'p', reply:'r', cwd:dir, round:1, max:2 });
   assert.match(text, /a\.txt \|/);
   assert.match(text, /cut at/);
   assert.ok(text.length < DIFF_LIMIT + 3000);
+  assert.doesNotMatch(text, /New files/);
+  fs.writeFileSync(path.join(dir, 'b.txt'), 'new\n');
+  assert.match(await reviewRequest({ prompt:'p', reply:'r', cwd:dir, round:1, max:2 }), /New files[^\n]*\nb\.txt/, 'git diff leaves out untracked files');
+});
+
+test('the Critic harness setting picks the critic harness', async () => {
+  const { engine, agents } = rig({ settings:{ critic:{ enabled:true, rounds:2, harness:'claude' } } });
+  await engine.sweep();
+  assert.equal(agents.all().find(a => a.name === 'critic').harness, 'claude');
+});
+
+test('a step with no answer for an hour ends the chain, so the worker can sleep', async () => {
+  const { engine, exchanges } = rig();
+  await engine.sweep();
+  assert.ok(engine.holds('claude:w'));
+  exchanges.get('x0').createdAt = new Date(Date.now() - ANSWER_LIMIT_MS - 1000).toISOString();
+  await engine.sweep();
+  assert.ok(!engine.holds('claude:w'));
+  assert.equal(engine.chains()[0].ended, 'no answer in an hour');
 });
 
 test('worker and critic get their standing instructions', () => {
