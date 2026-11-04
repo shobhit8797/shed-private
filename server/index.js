@@ -24,6 +24,10 @@ import { interruptCodexThread } from './codex-app.js';
 import { uploadStore, attachmentNote, UPLOAD_ID } from './uploads.js';
 import { parseMenu, keysToChoose } from './menu.js';
 import { extractUrl, fetchShared, sharePrompt, signedShortcut } from './share.js';
+import { agentStore, agentState, launchArgs, memoryFile, AGENT_HARNESSES, AGENT_NAME, SLEEP_AFTER_MS } from './agents.js';
+import { accountStatus, getAccount, accountFor, accountEnv, addAccount, removeAccount, addToZshrc, forgetLoginState, sourceLine, inZshrc } from './accounts.js';
+import { criticEngine, launchExtras, prefs as criticPrefs, enabledFor as criticEnabledFor, workerNote, MAX_ROUNDS, CRITIC_NAME } from './critic.js';
+import { tailscaleStatus, publish as publishTailscale, unpublish as unpublishTailscale } from './tailscale.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const publicDir = path.join(root, 'public');
@@ -51,6 +55,18 @@ const pro = proStore(dataDir, { port });
 const uploads = uploadStore(dataDir);
 const attempts = new Map();
 const exchanges = exchangeStore(dataDir);
+const agents = agentStore(dataDir);
+const critic = criticEngine({ dataDir, settings:() => settings, agents, tasks:() => tasks, sessions:() => sessions(true), exchanges, sync:() => syncExchanges(), save:() => saveTasks(),
+  send:({ kind, from, to, message, title }) => sendExchange({ kind, from, to, message, prompt:`↔ Critic ${title}`, agentPrompt:messagePrompt(from, message, shedCli), target:to }) });
+// How phones reach Shed: the Cloudflare link (the default) or Tailscale. tunnel.js reads the same file and stops the
+// public Cloudflare link while Tailscale is chosen.
+const phoneAccessFile = path.join(dataDir, 'phone-access');
+const phoneAccess = () => { try { return fs.readFileSync(phoneAccessFile, 'utf8').trim() === 'tailscale' ? 'tailscale' : 'cloudflare'; } catch { return 'cloudflare'; } };
+let tailscale = { installed:false, serving:false, url:'', problem:'Checking Tailscale…' };
+async function refreshTailscale() {
+  tailscale = await tailscaleStatus({ shedPort:port }).catch(error => ({ ...tailscale, serving:false, url:'', problem:error.message }));
+  return tailscale;
+}
 // The `shed` command agents run (bin/shed) finds Shed through agent.json: this port and a key that only works from this Mac.
 const agentKey = crypto.randomBytes(24).toString('base64url');
 fs.writeFileSync(path.join(dataDir, 'agent.json'), JSON.stringify({ port, key:agentKey }), { mode:0o600 });
@@ -68,6 +84,7 @@ function getToken() {
   return value;
 }
 function remoteUrl() {
+  if (phoneAccess() === 'tailscale') return tailscale.url || '';
   try {
     const value = fs.readFileSync(remoteUrlFile, 'utf8').trim();
     // A Quick Tunnel address, or the permanent Shed Pro hostname; tunnel.js writes it once the tunnel is connected.
@@ -113,15 +130,21 @@ function verifyPassword(password, stored) {
   } catch { return false; }
 }
 const LOOPBACK = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
-const PROXY_HEADERS = ['cf-connecting-ip', 'cf-ray', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'forwarded'];
-// A request typed on this Mac: loopback, and not relayed by the tunnel (which also connects over loopback).
+const PROXY_HEADERS = ['cf-connecting-ip', 'cf-ray', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'forwarded', 'tailscale-user-login', 'tailscale-user-name'];
+const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+// A request typed on this Mac: loopback, addressed to localhost, and not relayed by the tunnel or by Tailscale Serve
+// (both connect over loopback). The Host check also catches a relay that adds none of these headers.
 function isDirectLocal(req) {
-  return LOOPBACK.includes(req.socket.remoteAddress) && !PROXY_HEADERS.some(h => req.headers[h] !== undefined);
+  return LOOPBACK.includes(req.socket.remoteAddress) && LOCAL_HOST.test(String(req.headers.host || '')) && !PROXY_HEADERS.some(h => req.headers[h] !== undefined);
 }
 // The visitor's real address: cloudflared connects locally and reports the original one in CF-Connecting-IP.
+// Tailscale Serve also connects locally and appends the visitor's address to X-Forwarded-For. Only the last entry
+// comes from the proxy, so a forged earlier entry is ignored. Without this every tailnet phone reads as 127.0.0.1.
 function clientIp(req) {
-  if (LOOPBACK.includes(req.socket.remoteAddress) && typeof req.headers['cf-connecting-ip'] === 'string') return req.headers['cf-connecting-ip'].slice(0, 64);
-  return req.socket.remoteAddress || 'unknown';
+  if (!LOOPBACK.includes(req.socket.remoteAddress)) return req.socket.remoteAddress || 'unknown';
+  if (typeof req.headers['cf-connecting-ip'] === 'string') return req.headers['cf-connecting-ip'].slice(0, 64);
+  const forwarded = typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'].split(',').pop().trim() : '';
+  return forwarded ? forwarded.slice(0, 64) : req.socket.remoteAddress;
 }
 function isLocalRequest(req) {
   if (!isDirectLocal(req)) return false;
@@ -193,6 +216,7 @@ function refreshCodexTerminalTask(task) {
     }
     task.waitingOn = '';
     Object.assign(task, { transcriptFile:found.file, nativeSessionId:found.id, sessionId:`codex:${found.id}` });
+    if (task.agentId) agents.link(task.agentId, found.id);
   }
   const progress = codexQueuedProgress(task);
   if (progress) return { status:progress.status, output:progress.output || task.output, error:progress.error || '' };
@@ -233,6 +257,7 @@ function refreshTerminalTasks() {
       }
       task.claudeSessionId = record[0];
       task.sessionId = `claude:${record[0]}`;
+      if (task.agentId) agents.link(task.agentId, record[0]);
       changed = true;
     }
     if (!task.transcriptFile) {
@@ -315,7 +340,7 @@ async function watchAndNotify() {
     for (const task of tasks) {
       // A task created since the last check counts as running, so one that finishes within a single interval still notifies.
       const before = seen.tasks.get(task.id) ?? (Date.parse(task.createdAt) >= seen.at ? 'running' : undefined);
-      if (!['running', 'queued'].includes(before) || !['completed', 'failed'].includes(task.status) || !prefs.finished || task.exchangeKind === 'ask') continue;
+      if (!['running', 'queued'].includes(before) || !['completed', 'failed'].includes(task.status) || !prefs.finished || task.exchangeKind) continue; // An ask or a critic round is not news.
       const done = task.status === 'completed';
       notify({ title:`${label[task.harness] || task.harness} ${done ? 'finished' : 'stopped'}: ${task.title}`, body:done ? firstLine(task.output) || 'Tap to see the reply.' : firstLine(task.error) || 'Tap to see what happened.', url:`/?task=${encodeURIComponent(task.id)}`, tag:`task-${task.id}` }).catch(() => {});
     }
@@ -390,7 +415,7 @@ async function routeInput(input, preview = false) {
   const chosen = input.harness && input.harness !== 'auto';
   const pickable = chosen ? healthyHarnesses : routableHarnesses(healthyHarnesses, autoRoutePrefs(settings.autoRoute, harnesses));
   const all = sessions();
-  let requestedCwd = typeof input.cwd === 'string' && all.some(s => s.cwd === input.cwd) ? input.cwd : '';
+  let requestedCwd = typeof input.cwd === 'string' && (all.some(s => s.cwd === input.cwd) || agents.all().some(a => a.cwd === input.cwd)) ? input.cwd : '';
   if (input.newWorkspace) {
     const name = String(input.newWorkspace).trim();
     if (!/^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,59}$/.test(name) || name === '.' || name === '..') throw new Error('Workspace names must be 1–60 letters, numbers, spaces, dots, dashes, or underscores.');
@@ -637,6 +662,29 @@ async function autoCloseIdle() {
     if (idle.length) { sessions(true); broadcast('sessions', {}); }
   } finally { autoClosing = false; }
 }
+// Agents sleep: once an agent has no Shed task and is not asking anything (permission prompts keep it awake), Shed
+// ends it the same way as "End session" and closes its Terminal tab. The agent keeps its session ID, so the next
+// message resumes the same conversation in a new window.
+let agentsSleeping = false;
+async function sleepIdleAgents() {
+  if (agentsSleeping || !agents.all().length) return;
+  agentsSleeping = true;
+  try {
+    const claudeLive = claudeLiveSessions();
+    const awake = sessions().filter(s => s.liveState === 'open' && agents.forSession(s) && !critic.holds(s.id)); // A review waiting on a worker keeps it open.
+    const idle = idleSessions(awake, { hours:SLEEP_AFTER_MS / 3600000, tasks, statusOf:s => s.harness === 'claude' ? claudeLive.get(s.nativeId)?.statusUpdatedAt || 0 : 0 });
+    for (const session of idle) {
+      if (session.harness === 'claude' && claudeLive.get(session.nativeId)?.status !== 'idle') continue;
+      const target = endTarget(session);
+      if (!target?.pid) continue;
+      const result = await endAgent(target).catch(error => ({ stopped:false, error }));
+      if (!result.stopped) { console.error(`Agent sleep: ${session.id} did not stop${result.error ? `: ${result.error.message}` : ''}`); continue; }
+      const tab = await closeTerminalTab(session.tty).catch(error => ({ closed:false, reason:error.message }));
+      console.log(`Agent ${agents.forSession(session)?.name} (${projectLabel(session.cwd)}) finished its task and went to sleep; tab ${tab.closed ? 'closed' : `left open (${tab.reason})`}.`);
+    }
+    if (idle.length) { sessions(true); broadcast('sessions', {}); }
+  } finally { agentsSleeping = false; }
+}
 // Sessions talking to each other. An agent runs `shed ask`; Shed finds which session it is from the command's parent
 // processes, then sends the message to the other session as a task, whose reply goes back to the asking agent.
 const TALKERS = ['claude', 'codex'];
@@ -664,8 +712,9 @@ function callerSession(pid) {
   return null;
 }
 async function sendExchange({ kind, from, to, message, prompt, agentPrompt, target, depth = 0 }) {
-  const { input, route, cwd, model } = await planTask({ prompt, agentPrompt, sessionId:target.id, followup:'stay', harness:'auto', model:'', newSession:false });
-  const task = startTask({ ...input, agentPrompt }, route, model, cwd);
+  // A critic that does not exist yet (`fresh`) starts as a new session of its agent in the project.
+  const { input, route, cwd, model } = await planTask(target.fresh ? { prompt, agentPrompt, followup:'stay', harness:target.harness, cwd:target.cwd, model:'', newSession:true } : { prompt, agentPrompt, sessionId:target.id, followup:'stay', harness:'auto', model:'', newSession:false });
+  const task = startTask({ ...input, agentPrompt, noCritic:true }, route, model, cwd, target.agent);
   Object.assign(task, { exchangeKind:kind }); saveTasks();
   const exchange = exchanges.add({ id:crypto.randomUUID().slice(0, 8), kind, from:from.id, to:to.id, message, taskId:task.id, depth, status:'sending', createdAt:new Date().toISOString() });
   task.exchangeId = exchange.id; saveTasks();
@@ -685,7 +734,13 @@ async function agentRoute(req, res, pathname) {
     const message = typeof input.message === 'string' ? input.message.trim().slice(0, 20000) : '';
     if (!message) return send(res, 400, { error:'Say what to send.' });
     const list = sessions(true);
-    const from = callerSession(Number(input.pid)), to = list.find(s => s.id === input.to);
+    const from = callerSession(Number(input.pid));
+    let to = list.find(s => s.id === input.to);
+    if (input.to === 'critic') { // `shed ask critic`: the critic of the caller's project.
+      if (from && !criticEnabledFor(settings.critic, agents.forSession(from))) return send(res, 409, { error:'The critic is off. Answer without it.' });
+      to = from && critic.target(from);
+      if (!to) return send(res, 409, { error:'There is no critic for you. You may be the critic.' });
+    }
     const open = exchanges.open();
     const why = refusal({ from, to, open, recent:from ? exchanges.sentWithin(from.id, 3600000) : 0 }) || (TALKERS.includes(to.harness) ? '' : 'Only Claude and Codex sessions can take messages for now.');
     if (why) return send(res, 409, { error:why });
@@ -732,6 +787,16 @@ function queueCodexTask(task, session) {
 const CONTROL_KEYS = ['\u0003', '\u001b[Z', '1', '2', '3', ''];
 const loginCommands = { codex:['codex', 'login'], claude:['claude', 'auth', 'login'], gemini:['gemini'], opencode:['opencode', 'auth', 'login'], pi:['pi'] };
 const loginTerminals = new Map();
+// Opens (or finds) the sign-in window of one account; the account's folder is set for that command only.
+async function openAccountLogin(account) {
+  if (!available[account.harness]) throw new Error(`${account.harness} is not installed on this Mac.`);
+  const existing = loginTerminals.get(account.id);
+  if (existing && (await readTerminalAsync(existing, 1)) !== null) return existing;
+  const tty = await openTerminalAsync(os.homedir(), loginCommands[account.harness], undefined, accountEnv(account));
+  loginTerminals.set(account.id, tty);
+  forgetLoginState(account.id);
+  return tty;
+}
 // A terminal reading for the phone: the screen text plus, when the agent is asking, the options it offers.
 function terminalReading(tty, text) { return { tty, text, menu:parseMenu(text.split('\n').slice(-40).join('\n')) }; }
 // Choosing an option: the screen is read again and the option must still be there with the same text, so a tap made
@@ -756,6 +821,10 @@ function startTerminalTask(task, route, modelDecision, cwd, agentPrompt, skipPer
 async function deliverToTerminal(task, route, modelDecision, cwd, agentPrompt, skipPermissions) {
   const session = route.session;
   const label = task.harness === 'codex' ? 'Codex' : 'Claude';
+  const agent = task.agentId ? agents.get(task.agentId) : null;
+  const agentArgs = agent ? launchArgs(agent, { resume:Boolean(session), ...launchExtras(settings.critic, agent, shedCli) }) : [];
+  // A resumed session, and an agent, keep their own account; a new session uses the one chosen in the composer.
+  const accountVars = accountEnv(accountFor(task.harness, session?.account || agent?.account || task.account));
   try {
     // Only type into a session's window while the agent is still running there; otherwise resume it in a new window.
     if (session?.tty && agentInForeground(session.tty, task.harness)) {
@@ -779,8 +848,8 @@ async function deliverToTerminal(task, route, modelDecision, cwd, agentPrompt, s
       const promptFile = path.join(promptDir, `${task.id}.txt`);
       fs.writeFileSync(promptFile, agentPrompt, { mode:0o600 });
       // --no-alt-screen keeps Codex's output in Terminal's scrollback, which is what the drawer's terminal view reads.
-      const argv = ['codex', ...(session ? ['resume', session.nativeId] : []), '--no-alt-screen', ...(modelDecision.model ? ['--model', modelDecision.model] : []), ...(skipPermissions ? ['--dangerously-bypass-approvals-and-sandbox'] : [])];
-      const tty = await openTerminalAsync(cwd, argv, promptFile);
+      const argv = ['codex', ...(session ? ['resume', session.nativeId] : []), '--no-alt-screen', ...(modelDecision.model ? ['--model', modelDecision.model] : []), ...(skipPermissions ? ['--dangerously-bypass-approvals-and-sandbox'] : []), ...agentArgs];
+      const tty = await openTerminalAsync(cwd, argv, promptFile, accountVars);
       Object.assign(task, { tty, permissions:skipPermissions ? 'skip' : 'default', ...(session ? { transcriptFile:session.file, nativeSessionId:session.nativeId } : {}), output:`Opened a new Terminal window on the Mac (${tty.replace('/dev/', '')}).${skipPermissions ? '' : ' Codex will ask there before running commands; answer from the Terminal view.'}` });
     } else {
       const promptDir = path.join(dataDir, 'prompts');
@@ -788,8 +857,8 @@ async function deliverToTerminal(task, route, modelDecision, cwd, agentPrompt, s
       const promptFile = path.join(promptDir, `${task.id}.txt`);
       fs.writeFileSync(promptFile, agentPrompt, { mode:0o600 });
       if (session) task.transcriptOffset = transcriptSize(session.file);
-      const argv = ['claude', ...(session ? ['--resume', session.nativeId] : []), ...(modelDecision.model ? ['--model', modelDecision.model] : []), ...(skipPermissions ? ['--dangerously-skip-permissions'] : ['--allow-dangerously-skip-permissions'])];
-      const tty = await openTerminalAsync(cwd, argv, promptFile);
+      const argv = ['claude', ...(session ? ['--resume', session.nativeId] : []), ...(modelDecision.model ? ['--model', modelDecision.model] : []), ...(skipPermissions ? ['--dangerously-skip-permissions'] : ['--allow-dangerously-skip-permissions']), ...agentArgs];
+      const tty = await openTerminalAsync(cwd, argv, promptFile, accountVars);
       Object.assign(task, { tty, permissions:skipPermissions ? 'skip' : 'default', output:`Opened a new Terminal window on the Mac (${tty.replace('/dev/', '')}).${skipPermissions ? '' : ' Claude will ask there before using tools; answer from the Terminal view.'}` });
     }
     task.updatedAt = new Date().toISOString();
@@ -799,7 +868,8 @@ async function deliverToTerminal(task, route, modelDecision, cwd, agentPrompt, s
   }
 }
 
-function startTask(input, route, modelDecision, requestedCwd = '') {
+// A message to an agent's session (or a new agent) carries the agent, so its window gets the agent's identity flags.
+function startTask(input, route, modelDecision, requestedCwd = '', agent = agents.forSession(route.session)) {
   let agentPrompt = (input.agentPrompt || input.prompt).trim();
   const harness = route.session?.harness || route.harness;
   if (!available[harness]) throw new Error(`${harness} CLI is not installed on this desktop.`);
@@ -809,6 +879,7 @@ function startTask(input, route, modelDecision, requestedCwd = '') {
   // Attached files move into the project, and the agent is told where they are.
   const attachments = [...(input.attachmentPaths || []), ...uploads.place(input.attachments || [], cwd === root ? '' : cwd)];
   agentPrompt += attachmentNote(attachments);
+  if (!agent && !input.noCritic && TALKERS.includes(harness) && criticEnabledFor(settings.critic)) agentPrompt += `\n\n${workerNote(shedCli)}`; // A plain session has no standing instructions, so the note rides with the message.
   const task = {
     id: crypto.randomUUID(), prompt: input.prompt.trim(), title: titleFor(input.prompt),
     status: 'running', harness, sessionId: route.session?.id || null,
@@ -817,6 +888,8 @@ function startTask(input, route, modelDecision, requestedCwd = '') {
     model:modelDecision.model, modelReason:modelDecision.reason, modelSource:modelDecision.source, modelFallbackReason:modelDecision.fallbackReason || '', cwd, output: '', error: '',
     createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     ...(attachments.length ? { attachments, agentPrompt } : {}),
+    ...(agent ? { agentId:agent.id, agentName:agent.name } : {}),
+    ...(input.account ? { account:input.account } : {}),
   };
   tasks.unshift(task); saveTasks();
   // Codex open in the desktop app (no terminal) takes queued messages; everything else runs in a visible Terminal.
@@ -842,7 +915,7 @@ function startTask(input, route, modelDecision, requestedCwd = '') {
   } else {
     args = ['run', '--format', 'json', ...modelArgs, ...(route.session ? ['--session', route.session.nativeId] : []), agentPrompt];
   }
-  const child = spawn(command, args, { cwd, env: { ...process.env, NO_COLOR: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(command, args, { cwd, env: { ...process.env, ...accountEnv(accountFor(harness, route.session?.account || agent?.account || input.account)), NO_COLOR: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
   active.set(task.id, child);
   if (harness === 'codex') child.stdin.end(agentPrompt); else child.stdin.end();
   let pending = '';
@@ -1122,11 +1195,29 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/api/connect' && req.method === 'GET') {
       const base = remoteUrl() || (lanEnabled ? `http://${lanAddress()}:${port}` : '');
-      if (!base) return send(res, 200, { url:'', secure:false, qr:'', phoneConnectedAt:settings.phoneConnectedAt || null });
+      const via = phoneAccess();
+      if (!base) return send(res, 200, { url:'', via, problem:via === 'tailscale' ? tailscale.problem || 'Tailscale is not serving Shed. Choose Tailscale again under Settings → Phone access.' : '', secure:false, qr:'', phoneConnectedAt:settings.phoneConnectedAt || null });
       // The QR code carries a one-time pairing code (10 minutes), so a phone that scans it is approved without a second step.
       const url = isLocalRequest(req) ? `${base}/#pair=${newPairingCode()}` : base;
       const svg = await QRCode.toString(url, { type:'svg', margin:1, errorCorrectionLevel:'M', color:{ dark:'#1e1c19', light:'#fffdf8' } });
-      return send(res, 200, { url, link:base, secure:Boolean(remoteUrl()), qr:svg, phoneConnectedAt:settings.phoneConnectedAt || null });
+      return send(res, 200, { url, link:base, via, secure:Boolean(remoteUrl()), qr:svg, phoneConnectedAt:settings.phoneConnectedAt || null });
+    }
+    if (pathname === '/api/phone-access' && req.method === 'GET') {
+      if (new URL(req.url, 'http://localhost').searchParams.get('refresh') === '1') await refreshTailscale();
+      return send(res, 200, { mode:phoneAccess(), canChange:isLocalRequest(req), tailscale });
+    }
+    if (pathname === '/api/phone-access' && req.method === 'POST') {
+      if (!isLocalRequest(req)) return send(res, 403, { error:'Change phone access on the Mac.' });
+      const { mode } = await body(req);
+      if (mode === 'tailscale') {
+        tailscale = await publishTailscale({ shedPort:port });
+        if (!tailscale.url) return send(res, 409, { error:tailscale.problem || 'Tailscale did not give Shed an address.' });
+        fs.writeFileSync(phoneAccessFile, 'tailscale\n', { mode:0o600 });
+      } else if (mode === 'cloudflare') {
+        fs.writeFileSync(phoneAccessFile, 'cloudflare\n', { mode:0o600 });
+        tailscale = await unpublishTailscale({ shedPort:port }).catch(error => ({ ...tailscale, problem:error.message }));
+      } else return send(res, 400, { error:'Choose cloudflare or tailscale.' });
+      return send(res, 200, { mode:phoneAccess(), canChange:true, tailscale });
     }
     if (pathname === '/api/bootstrap' && req.method === 'GET') {
       // Everything the app needs to open, in one round trip: who you are, sessions, tasks, harness health and models.
@@ -1190,7 +1281,34 @@ const server = http.createServer(async (req, res) => {
       req.on('close', () => eventClients.delete(res));
       return;
     }
-    if (pathname === '/api/sessions' && req.method === 'GET') return sendVersioned(req, res, { sessions: sessions().map(publicSession) });
+    if (pathname === '/api/sessions' && req.method === 'GET') return sendVersioned(req, res, { sessions: sessions().map(s => { const agent = agents.forSession(s); return { ...publicSession(s), agent:agent ? { id:agent.id, name:agent.name, enabled:agent.enabled } : null }; }) });
+    if (pathname === '/api/agents' && req.method === 'GET') {
+      const all = sessions();
+      return send(res, 200, { agents:agents.all().map(agent => {
+        const session = all.find(s => agents.forSession(s)?.id === agent.id);
+        return { id:agent.id, name:agent.name, cwd:agent.cwd, harness:agent.harness, account:agent.account || `${agent.harness}:default`, enabled:agent.enabled, critic:typeof agent.critic === 'boolean' ? agent.critic : null, createdAt:agent.createdAt, state:agentState(agent, session), sessionId:session?.id || null, memoryFile:memoryFile(agent) };
+      }) });
+    }
+    if (pathname === '/api/critic' && req.method === 'GET') return send(res, 200, { prefs:criticPrefs(settings.critic), maxRounds:MAX_ROUNDS });
+    if (pathname === '/api/critic' && req.method === 'POST') {
+      const input = await body(req);
+      settings = { ...settings, critic:criticPrefs({ ...settings.critic, ...input }) }; saveSettings();
+      return send(res, 200, { prefs:settings.critic });
+    }
+    const agentCritic = pathname.match(/^\/api\/agents\/([0-9a-f-]{36})\/critic$/);
+    if (agentCritic && req.method === 'POST') {
+      const input = await body(req); // mode: "on", "off" or "default"
+      if (!agents.setCritic(agentCritic[1], input.mode === 'on' ? true : input.mode === 'off' ? false : null)) return send(res, 404, { error:'Agent not found.' });
+      return send(res, 200, { ok:true });
+    }
+    const agentAction = pathname.match(/^\/api\/agents\/([0-9a-f-]{36})\/(on|off|delete)$/);
+    if (agentAction && req.method === 'POST') {
+      const [, id, action] = agentAction;
+      if (!agents.get(id)) return send(res, 404, { error:'Agent not found.' });
+      if (action === 'delete') agents.remove(id); else agents.setEnabled(id, action === 'on');
+      broadcast('sessions', {});
+      return send(res, 200, { ok:true });
+    }
     if (pathname === '/api/push' && req.method === 'GET') {
       const endpoint = new URL(req.url, 'http://x').searchParams.get('endpoint') || '';
       return send(res, 200, { publicKey:pushPublicKey(), subscribed:endpoint ? isSubscribed(endpoint) : false, devices:pushCount(), prefs:notifyPrefs() });
@@ -1234,6 +1352,27 @@ const server = http.createServer(async (req, res) => {
       const file = resolveInside(root, query.get('path'));
       if (!file) return send(res, 404, { error:'That file is not available.' });
       return sendFile(req, res, file, query.get('download') === '1');
+    }
+    if (pathname === '/api/accounts' && req.method === 'GET') return send(res, 200, { accounts:await accountStatus(harnessHealth()), sourceLine:sourceLine(), inZshrc:inZshrc() });
+    if (pathname.startsWith('/api/accounts') && req.method === 'POST') {
+      if (!isLocalRequest(req)) return send(res, 403, { error:'Change accounts on the Mac.' });
+      if (pathname === '/api/accounts/zshrc') return send(res, 200, addToZshrc());
+      if (pathname === '/api/accounts') {
+        const input = await body(req);
+        let account;
+        try { account = addAccount({ harness:input.harness, name:input.name }); } catch (error) { return send(res, 400, { error:error.message }); }
+        return send(res, 201, { account:{ id:account.id, harness:account.harness, name:account.name, alias:account.alias }, tty:await openAccountLogin(account) });
+      }
+      const accountAction = pathname.match(/^\/api\/accounts\/([^/]+)\/(login|delete)$/);
+      const account = accountAction && getAccount(decodeURIComponent(accountAction[1]));
+      if (!account) return send(res, 404, { error:'Account not found.' });
+      if (accountAction[2] === 'login') return send(res, 200, { tty:await openAccountLogin(account) });
+      // An agent on a removed account would silently continue under the default login, in an empty conversation.
+      const user = agents.all().find(a => a.account === account.id);
+      if (user) return send(res, 409, { error:`The agent ${user.name} uses this account. Delete that agent first.` });
+      try { removeAccount(account.id); } catch (error) { return send(res, 400, { error:error.message }); }
+      broadcast('sessions', {});
+      return send(res, 200, { ok:true });
     }
     // Git for developers: what a session changed, one file's diff, and commit / push / pull request from the phone.
     const gitMatch = pathname.match(/^\/api\/sessions\/(.+)\/(changes|diff|git|pr|check-logs)$/);
@@ -1424,6 +1563,28 @@ const server = http.createServer(async (req, res) => {
       input = { ...input, attachments:attachmentIds, attachmentPaths:[] };
       if (attachmentIds.length && typeof input.prompt === 'string' && !input.prompt.trim()) input.prompt = attachmentIds.length > 1 ? 'Take a look at these files.' : 'Take a look at this file.';
       if (typeof input.prompt !== 'string' || !input.prompt.trim() || input.prompt.length > 20000) return send(res, 400, { error: 'Prompt must be between 1 and 20,000 characters.' });
+      // A message to an agent: its conversation if it has one, otherwise a new one in its project. A new agent name
+      // makes a new agent, on Claude Code or Codex (Laya's choice is limited to those two).
+      let agent = null;
+      const agentName = typeof input.agentName === 'string' ? input.agentName.trim().toLowerCase() : '';
+      if (input.agentId) {
+        agent = agents.get(String(input.agentId));
+        if (!agent) return send(res, 404, { error:'Agent not found.' });
+        const session = sessions(true).find(s => agents.forSession(s)?.id === agent.id);
+        input = session ? { ...input, sessionId:session.id, newSession:false, followup:'stay' } : { ...input, sessionId:null, newSession:true, harness:agent.harness, cwd:agent.cwd, newWorkspace:'' };
+      } else if (agentName) {
+        if (!AGENT_NAME.test(agentName)) return send(res, 400, { error:'Agent names must be 1–40 lowercase letters, numbers, or dashes, and start with a letter or number.' });
+        if (agentName === CRITIC_NAME) return send(res, 400, { error:'The name "critic" is for the critic agent. Choose another name.' });
+        const ready = AGENT_HARNESSES.filter(h => available[h] && harnessHealth()?.[h]?.state === 'ready');
+        input = { ...input, sessionId:null, newSession:true, harness:AGENT_HARNESSES.includes(input.harness) ? input.harness : ready[0] || 'claude' };
+      }
+      if (agent && !agent.enabled) return send(res, 409, { error:`The agent ${agent.name} is turned off. Turn it on under Settings → Agents.` });
+      // A new session on a chosen account runs on that account's harness.
+      if (typeof input.account === 'string' && input.account && !input.sessionId && !agent) {
+        const account = getAccount(input.account);
+        if (!account) return send(res, 404, { error:'Account not found.' });
+        input = { ...input, harness:account.harness };
+      }
       let { input:planned, route, cwd, model } = await planTask(input);
       input = planned;
       // A new session in a git project works on a branch of its own, in its own checkout.
@@ -1431,7 +1592,16 @@ const server = http.createServer(async (req, res) => {
       if (ownBranch) cwd = ownBranch.path;
       if (route.session?.liveState === 'working' && !['codex', 'claude'].includes(route.session.harness)) return send(res, 409, { error: 'This desktop session is still working. Wait for it to finish before sending a follow-up.' });
       if (route.session && [...active.values()].some(child => child.layaSessionId === route.session.id)) return send(res, 409, { error: 'This session is already running a task.' });
-      const task = startTask(input, route, model, cwd);
+      let made = null;
+      if (agentName) {
+        try { agent = made = agents.create({ name:agentName, cwd, harness:route.harness, account:accountFor(route.harness, input.account).id }); }
+        catch (error) { return send(res, 409, { error:error.message }); }
+      } else if (!agent) agent = agents.forSession(route.session);
+      if (route.handoffFrom) agent = null; // A handoff starts a new session in another harness; the agent stays where it was.
+      if (agent && !agent.enabled) return send(res, 409, { error:`The agent ${agent.name} is turned off. Turn it on under Settings → Agents.` });
+      let task;
+      // An agent made for a task that did not start would block a retry with the same name.
+      try { task = startTask(input, route, model, cwd, agent); } catch (error) { if (made) agents.remove(made.id); throw error; }
       if (ownBranch) { Object.assign(task, { branch:ownBranch.branch, project:ownBranch.project }); saveTasks(); }
       if (route.session && active.has(task.id)) active.get(task.id).layaSessionId = route.session.id;
       return send(res, 201, { task });
@@ -1479,7 +1649,13 @@ server.listen(port, host, () => {
   });
   setInterval(() => refreshHarnessHealth().catch(error => console.error(`Harness health check failed: ${error.message}`)), 60000).unref();
   watchAndNotify();
-  setInterval(() => { sessions(true); watchAndNotify(); }, 10000).unref();
+  setInterval(() => {
+    // One bad transcript or registry must not stop the server: an uncaught throw here ends the process.
+    try { sessions(true); watchAndNotify(); } catch (error) { console.error(`Session refresh failed: ${error.message}`); }
+    critic.sweep().catch(error => console.error(`Critic failed: ${error.message}`));
+    sleepIdleAgents().catch(error => console.error(`Agent sleep failed: ${error.message}`)); }, 10000).unref();
+  refreshTailscale().then(ts => { if (phoneAccess() === 'tailscale') console.log(ts.url ? `Phones connect through Tailscale: ${ts.url}` : `Tailscale is chosen for phones, but: ${ts.problem}`); });
+  setInterval(() => refreshTailscale(), 60000).unref();
   pro.check();
   setInterval(() => pro.check(), 3600000).unref();
   setInterval(() => autoCloseIdle().catch(error => console.error(`Auto-close failed: ${error.message}`)), 600000).unref();

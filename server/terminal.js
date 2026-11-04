@@ -2,14 +2,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
+import { listAccounts } from './accounts.js';
 import { terminalCall } from './terminal-worker.js';
 
 // Claude Code writes ~/.claude/sessions/<pid>.json for each running interactive session, with its session ID and busy/idle status.
 export function claudeLiveSessions() {
-  const dir = path.join(os.homedir(), '.claude', 'sessions');
   const live = new Map();
+  for (const account of listAccounts().filter(a => a.harness === 'claude')) readLive(path.join(account.configDir, 'sessions'), live);
+  return live;
+}
+function readLive(dir, live) {
   let names = [];
-  try { names = fs.readdirSync(dir).filter(name => /^\d+\.json$/.test(name)); } catch { return live; }
+  try { names = fs.readdirSync(dir).filter(name => /^\d+\.json$/.test(name)); } catch { return; }
   for (const name of names) {
     try {
       const record = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
@@ -17,7 +21,6 @@ export function claudeLiveSessions() {
       live.set(record.sessionId, { pid:record.pid, status:record.status || '', statusUpdatedAt:record.statusUpdatedAt || 0, tty:ttyOf(record.pid) });
     } catch { /* A session may be writing its record. */ }
   }
-  return live;
 }
 
 function processAlive(pid) {
@@ -121,8 +124,13 @@ end run`, [tty]);
 function shellQuote(value) { return `'${String(value).replace(/'/g, `'\\''`)}'`; }
 
 // Opens a new Terminal window running the command in cwd. The prompt is read from a private file so it needs no shell quoting.
-export function openTerminal(cwd, argv, promptFile) {
-  const command = `cd ${shellQuote(cwd)} && ${argv.map(shellQuote).join(' ')}${promptFile ? ` "$(cat ${shellQuote(promptFile)}; rm -f ${shellQuote(promptFile)})"` : ''}`;
+// `env` (an account's CLAUDE_CONFIG_DIR or CODEX_HOME) goes on the command line, so it applies to this command only.
+export function terminalCommand(cwd, argv, promptFile, env = {}) {
+  const vars = Object.entries(env).map(([key, value]) => `${key}=${shellQuote(value)} `).join('');
+  return `cd ${shellQuote(cwd)} && ${vars}${argv.map(shellQuote).join(' ')}${promptFile ? ` "$(cat ${shellQuote(promptFile)}; rm -f ${shellQuote(promptFile)})"` : ''}`;
+}
+export function openTerminal(cwd, argv, promptFile, env) {
+  const command = terminalCommand(cwd, argv, promptFile, env);
   const tty = osascript(`on run argv
   tell application "Terminal"
     set t to do script (item 1 of argv)
@@ -194,8 +202,8 @@ end run`, [tty, value]);
   await send('');
 }
 
-export async function openTerminalAsync(cwd, argv, promptFile) {
-  const command = `cd ${shellQuote(cwd)} && ${argv.map(shellQuote).join(' ')}${promptFile ? ` "$(cat ${shellQuote(promptFile)}; rm -f ${shellQuote(promptFile)})"` : ''}`;
+export async function openTerminalAsync(cwd, argv, promptFile, env) {
+  const command = terminalCommand(cwd, argv, promptFile, env);
   const tty = useWorker ? await terminalCall('open', { command }) : await osascriptAsync(`on run argv
   tell application "Terminal"
     set t to do script (item 1 of argv)

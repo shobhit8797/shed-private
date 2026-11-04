@@ -13,13 +13,13 @@ let checkedAt = 0;
 let pending;
 let snapshot = Object.fromEntries(harnessNames.map(name => [name, { installed:false, state:'checking', detail:'Checking the CLI', checkedAt:null }]));
 
-function run(command, args, timeoutMs = 5000) {
+function run(command, args, timeoutMs = 5000, extraEnv = {}) {
   return new Promise(resolve => {
     let output = '';
     let settled = false;
     let child;
     const finish = result => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); };
-    try { child = spawn(command, args, { env:{ ...process.env, NO_COLOR:'1', CI:'1' }, stdio:['ignore','pipe','pipe'] }); }
+    try { child = spawn(command, args, { env:{ ...process.env, ...extraEnv, NO_COLOR:'1', CI:'1' }, stdio:['ignore','pipe','pipe'] }); }
     catch (error) { return resolve({ ok:false, output:error.message }); }
     const timer = setTimeout(() => { child.kill('SIGKILL'); finish({ ok:false, output:'The CLI did not respond in time.' }); }, timeoutMs);
     for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => { output = (output + chunk.toString()).slice(-4000); });
@@ -32,13 +32,14 @@ function result(installed, state, detail) {
   return { installed, state, detail, checkedAt:new Date().toISOString() };
 }
 
-async function probe(name) {
+// extraEnv points a probe at one account's folder (CLAUDE_CONFIG_DIR or CODEX_HOME).
+export async function probe(name, extraEnv = {}) {
   const installed = spawnSync('which', [name], { encoding:'utf8', timeout:2000 }).status === 0;
   if (!installed) return result(false, 'offline', 'CLI is not installed');
-  const version = await run(name, ['--version'], 12000);
+  const version = await run(name, ['--version'], 12000, extraEnv);
   if (!version.ok) return result(true, 'offline', version.output || 'CLI did not respond');
   if (name === 'codex') {
-    const auth = await run(name, ['login', 'status']);
+    const auth = await run(name, ['login', 'status'], 5000, extraEnv);
     return auth.ok && /logged in/i.test(auth.output) ? result(true, 'ready', 'CLI responds; Codex login is active') : result(true, 'needs_auth', 'Sign in with codex login');
   }
   if (name === 'gemini') {
@@ -59,7 +60,7 @@ async function probe(name) {
     return auth.ok && /\b[1-9]\d* credentials?\b/i.test(output) ? result(true, 'ready', 'CLI responds; provider credentials are configured') : result(true, 'needs_auth', 'Connect a provider on the Mac');
   }
   if (name === 'claude') {
-    const auth = await run(name, ['auth', 'status']);
+    const auth = await run(name, ['auth', 'status'], 5000, extraEnv);
     let loggedIn = false;
     try { loggedIn = JSON.parse(auth.output).loggedIn === true; } catch { loggedIn = /logged in/i.test(auth.output); }
     return auth.ok && loggedIn ? result(true, 'ready', 'CLI responds; Claude login is active') : result(true, 'needs_auth', 'Sign in to Claude Code from the Mac');

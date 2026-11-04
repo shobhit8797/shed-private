@@ -3,11 +3,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { liveSessionStates } from './live.js';
+import { listAccounts, transcriptDir } from './accounts.js';
 
 const home = os.homedir();
 const roots = {
-  codex: path.join(home, '.codex', 'sessions'),
-  claude: path.join(home, '.claude', 'projects'),
   gemini: path.join(home, '.gemini', 'tmp'),
   pi: path.join(home, '.pi', 'agent', 'sessions'),
 };
@@ -175,14 +174,25 @@ function parseCached(file, parse) {
   return item;
 }
 
+// Claude and Codex transcripts of every account, each session marked with its account id.
+export function accountSessions(accounts = listAccounts()) {
+  const sessions = [];
+  for (const account of accounts) {
+    const dir = transcriptDir(account);
+    const files = account.harness === 'codex' ? walk(dir, f => f.endsWith('.jsonl'), 5) : walk(dir, f => f.endsWith('.jsonl') && !f.includes('/subagents/'), 3);
+    for (const file of files) {
+      try { const item = parseCached(file, account.harness === 'codex' ? codexRecord : claudeRecord); if (item) sessions.push({ ...item, account:account.id }); } catch { /* Ignore incomplete live files. */ }
+    }
+  }
+  return sessions;
+}
+
 export function discoverSessions() {
   const inputs = [
-    ...walk(roots.codex, f => f.endsWith('.jsonl'), 5).map(file => [file, codexRecord]),
-    ...walk(roots.claude, f => f.endsWith('.jsonl') && !f.includes('/subagents/'), 3).map(file => [file, claudeRecord]),
     ...walk(roots.gemini, f => f.endsWith('.json') && f.includes('/chats/'), 4).map(file => [file, geminiRecord]),
     ...walk(roots.pi, f => f.endsWith('.jsonl'), 3).map(file => [file, piRecord]),
   ];
-  const sessions = [];
+  const sessions = accountSessions();
   for (const [file, parse] of inputs) {
     try { const item = parseCached(file, parse); if (item) sessions.push(item); } catch { /* Ignore incomplete live files. */ }
   }
@@ -312,7 +322,7 @@ export function claudeTerminalProgress(task) {
 export function findCodexTranscript(task) {
   const since = Date.parse(task.createdAt) - 5000;
   const expected = clean(task.agentPrompt || task.prompt, 20000).slice(0, 80);
-  const recent = walk(roots.codex, f => f.endsWith('.jsonl'), 5)
+  const recent = listAccounts().filter(a => a.harness === 'codex').flatMap(a => walk(transcriptDir(a), f => f.endsWith('.jsonl'), 5))
     .map(file => { try { return { file, mtime:fs.statSync(file).mtimeMs, birth:fs.statSync(file).birthtimeMs }; } catch { return null; } })
     .filter(x => x && x.birth >= since)
     .sort((a, b) => b.birth - a.birth);

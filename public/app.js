@@ -84,7 +84,7 @@ async function showAuth() {
   } catch {}
 }
 function hideAuth() { $('#auth-screen').classList.add('hidden'); }
-function setView(view) { state.view = view; if (view === 'settings') { loadShareSettings(); prepareShareLink(); loadAutoClose(); loadAutoRoute(); loadBranchSetting(); } $('#phone-message').classList.toggle('hidden', view !== 'inbox'); $$('.view').forEach(el => el.classList.toggle('hidden', el.id !== `view-${view}`)); $$('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === view)); $('#page-name').textContent = ({ inbox:'Command center', sessions:'Sessions', activity:'Activity', settings:'Settings' })[view]; const url = new URL(location.href); if (view === 'inbox') url.searchParams.delete('view'); else url.searchParams.set('view', view); history.replaceState(null, '', url); document.querySelector('.sidebar').classList.remove('open'); $('#mobile-scrim').classList.add('hidden'); render(); }
+function setView(view) { state.view = view; if (view === 'settings') { loadShareSettings(); prepareShareLink(); loadAutoClose(); loadAutoRoute(); loadBranchSetting(); loadCritic(); loadAgents(); loadAccounts(); loadPhoneAccess(true); } $('#phone-message').classList.toggle('hidden', view !== 'inbox'); $$('.view').forEach(el => el.classList.toggle('hidden', el.id !== `view-${view}`)); $$('.nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === view)); $('#page-name').textContent = ({ inbox:'Command center', sessions:'Sessions', activity:'Activity', settings:'Settings' })[view]; const url = new URL(location.href); if (view === 'inbox') url.searchParams.delete('view'); else url.searchParams.set('view', view); history.replaceState(null, '', url); document.querySelector('.sidebar').classList.remove('open'); $('#mobile-scrim').classList.add('hidden'); render(); }
 function renderHarnesses() {
   const names = { codex:'Codex', claude:'Claude Code', gemini:'Gemini', pi:'Pi', opencode:'OpenCode' };
   const labels = { ready:'READY', needs_auth:'SIGN IN', offline:'OFFLINE', unknown:'CHECK', checking:'CHECKING' };
@@ -123,7 +123,7 @@ document.addEventListener('focusout', e => {
 function renderHarnessAvailability() { const names = {codex:'Codex',claude:'Claude Code',gemini:'Gemini',pi:'Pi',opencode:'OpenCode'}; const installed = Object.keys(names).filter(name => state.available[name]); const select = $('#harness-select'); const current = select.value; setOptions(select, '<option value="auto">✦ Laya chooses</option>' + installed.map(name => `<option value="${name}">${names[name]}</option>`).join('')); select.value = installed.includes(current) ? current : 'auto'; const editor = $('#model-editor-harness'); setOptions(editor, installed.map(name => `<option value="${name}">${names[name]}</option>`).join('')); if (!installed.length) setOptions(editor, '<option value="">No installed harnesses</option>'); }
 function updateHarnessReadiness() { const labels = { needs_auth:'sign in', offline:'offline', unknown:'check login', checking:'checking' }; const select = $('#harness-select'); for (const option of select.options) { if (option.value === 'auto') continue; const status = state.health[option.value]?.state || 'checking'; const label = `${({codex:'Codex',claude:'Claude Code',gemini:'Gemini',pi:'Pi',opencode:'OpenCode'})[option.value]}${status === 'ready' ? '' : ` · ${option.value === 'opencode' && status === 'needs_auth' ? 'connect provider' : labels[status] || 'unavailable'}`}`; if (option.disabled !== (status !== 'ready')) option.disabled = status !== 'ready'; if (option.textContent !== label) option.textContent = label; } if (select.selectedOptions[0]?.disabled) { select.value = 'auto'; renderModelChoices(); } }
 function renderHealthDetails() { const issues = Object.entries(state.health).filter(([name, status]) => state.available[name] && status.state !== 'ready' && status.state !== 'checking'); if (issues.length) $('#harness-list').insertAdjacentHTML('beforeend', `<div class="harness-health-details">${issues.map(([name, status]) => `<div><b>${escapeHtml(({codex:'Codex',claude:'Claude Code',gemini:'Gemini',pi:'Pi',opencode:'OpenCode'})[name])}:</b> ${escapeHtml(status.detail)}</div>`).join('')}</div>`); }
-async function refreshHarnessHealth() { try { const data = await api('/api/harness-health'); state.health = data.harnesses || {}; renderHarnesses(); updateHarnessReadiness(); syncPhoneHarness(); } catch (error) { if (error.message === 'Authentication required.') showAuth(); } }
+async function refreshHarnessHealth() { try { const data = await api('/api/harness-health'); state.health = data.harnesses || {}; renderHarnesses(); updateHarnessReadiness(); syncPhoneHarness(); loadAccounts(); } catch (error) { if (error.message === 'Authentication required.') showAuth(); } }
 // The phone bar's project picker mirrors the composer's: a new folder (named from the message), a named new
 // workspace, or any project a session already uses.
 function syncPhoneProject() {
@@ -205,7 +205,7 @@ function permissionTag(session) {
   const mode = PERMISSIONS[session.permissions];
   return mode?.[0] && ['claude', 'codex'].includes(session.harness) ? ` · <span class="permission-tag ${escapeHtml(session.permissions)}">${escapeHtml(mode[0])}</span>` : '';
 }
-function sessionRow(s) { const live = s.liveState !== 'history'; return `<button class="session-row ${live ? 'is-live' : ''}" data-session="${escapeHtml(s.id)}">${symbol(s.harness)}<div><div class="title"><span class="title-copy">${escapeHtml(s.title)}</span>${live ? `<span class="live-pill ${escapeHtml(s.liveState)}">${s.liveState === 'working' ? 'WORKING' : 'OPEN'}</span>` : ''}${s.permissions === 'skip' ? '<span class="live-pill skip" title="Permissions skipped: acts without asking">SKIPS PERMISSIONS</span>' : ''}</div><div class="sub" title="${escapeHtml(s.cwd || '')}">${escapeHtml(projectName(s.cwd))}</div></div><span class="harness-name">${escapeHtml(s.harness === 'claude' ? 'Claude Code' : s.harness)}</span><span class="time">${relative(s.updatedAt)}</span><span class="arrow">↗</span></button>`; }
+function sessionRow(s) { const live = s.liveState !== 'history'; return `<button class="session-row ${live ? 'is-live' : ''}" data-session="${escapeHtml(s.id)}">${symbol(s.harness)}<div><div class="title"><span class="title-copy">${escapeHtml(s.title)}</span>${s.agent ? `<span class="live-pill" title="Agent">${escapeHtml(s.agent.name.toUpperCase())}</span>` : ''}${live ? `<span class="live-pill ${escapeHtml(s.liveState)}">${s.liveState === 'working' ? 'WORKING' : 'OPEN'}</span>` : ''}${s.permissions === 'skip' ? '<span class="live-pill skip" title="Permissions skipped: acts without asking">SKIPS PERMISSIONS</span>' : ''}</div><div class="sub" title="${escapeHtml(s.cwd || '')}">${escapeHtml(projectName(s.cwd))}</div></div><span class="harness-name">${escapeHtml(s.harness === 'claude' ? 'Claude Code' : s.harness)}</span><span class="time">${relative(s.updatedAt)}</span><span class="arrow">↗</span></button>`; }
 function taskCard(t) { return `<div class="task-card" data-task="${escapeHtml(t.id)}"><div class="task-card-top">${symbol(t.harness)}<span>${escapeHtml(t.harness === 'claude' ? 'Claude Code' : t.harness)} · ${escapeHtml(t.model || 'default model')}</span><span class="badge ${escapeHtml(t.status)}" style="margin-left:auto">${escapeHtml(t.status)}</span></div><div class="task-card-title">${escapeHtml(t.title)}</div><div class="task-card-meta"><span>${escapeHtml(projectName(t.cwd))}</span><span>${relative(t.createdAt)} ↗</span></div></div>`; }
 // Live sessions are pixel agents, one per harness, in the spirit of Claude Code's Clawd:
 // they type on a laptop while working, sip coffee while waiting, and hold up a sign when they need your OK.
@@ -366,7 +366,7 @@ function agentCard(session, index) {
   const [mood, status] = agentMoods[session.liveState] || agentMoods.open;
   return `<button class="agent ${mood}" data-session="${escapeHtml(session.id)}" style="--d:${(index * 0.83) % 4}s" aria-label="${escapeHtml(`${harnessNames[session.harness] || session.harness} in ${projectName(session.cwd) || 'a project'}: ${status}. ${session.title}`)}">
     <span class="agent-stage"><span class="agent-harness">${escapeHtml(harnessNames[session.harness] || session.harness)}</span>${agentSvg(session.harness, mood)}</span>
-    <span class="agent-name">${escapeHtml(projectName(session.cwd) || 'Untitled project')}</span>
+    <span class="agent-name">${escapeHtml(session.agent ? `${session.agent.name} · ${projectName(session.cwd)}` : projectName(session.cwd) || 'Untitled project')}</span>
     <span class="agent-status"><i></i>${status}</span>${talkBadge(session)}
     <span class="agent-title">${escapeHtml(session.title)}</span>
   </button>`;
@@ -443,7 +443,7 @@ async function init() {
   } catch (error) { if (error.message === 'Authentication required.') { forgetBoot(); showAuth(); } else showFeedback(error.message); }
 }
 async function previewRoute() { const prompt = $('#prompt').value.trim(); if (prompt.length < 9) { $('#route-preview').classList.add('hidden'); return; } try { const selectedProject = $('#project-select').value; const data = await api('/api/route', { method:'POST', body:JSON.stringify({prompt, harness:$('#harness-select').value, model:$('#model-select').value, cwd:selectedProject === '__new__' ? '' : selectedProject, newWorkspace:selectedProject === '__new__' ? $('#new-workspace').value : '', newSession:true}) }); if ($('#prompt').value.trim() !== prompt) return; const route = data.route; $('#route-preview').innerHTML = `<span class="route-symbol">✦</span><span><b>Local preview:</b> New ${escapeHtml(route.harness)} session · ${escapeHtml(route.reason)} · ${escapeHtml(route.model || 'harness default')} model</span>`; $('#route-preview').classList.remove('hidden'); } catch { $('#route-preview').classList.add('hidden'); } }
-async function sendTask(prompt, options = {}) { const attachKey = options.sessionId ? 'followup' : options.phone ? 'phone' : 'new', files = attached[attachKey]; if (files.some(f => f.status === 'uploading')) { showFeedback('Wait for the files to finish uploading.'); return false; } if (!prompt.trim() && !files.length) return; const button = options.sessionId ? $('#followup-send') : $('#send-button'); button.disabled = true; try { const selectedProject = $('#project-select').value; const isNew = !options.sessionId; if (files.some(f => f.status === 'failed')) throw new Error('Remove the files that failed to upload, then send again.'); const {task} = await api('/api/tasks', { method:'POST', body:JSON.stringify({ prompt, harness:options.harness || $('#harness-select').value, model:options.model ?? (options.sessionId ? $('#followup-model').value : $('#model-select').value), cwd:options.cwd ?? (selectedProject === '__new__' ? '' : selectedProject), newWorkspace:isNew && selectedProject === '__new__' ? $('#new-workspace').value : '', newSession:isNew, sessionId:options.sessionId || null, followup:options.followup || 'auto', attachments:files.map(f => f.id), skipPermissions:options.sessionId ? $('#followup-skip').checked : $('#skip-permissions').checked }) }); attached[attachKey] = []; renderAttachments(attachKey); $('#prompt').value = ''; $('#followup-prompt').value = ''; $('#followup-prompt').style.height = ''; state.followupPreviewKey = null; $('#followup-preview').classList.add('hidden'); $('#new-workspace').value = ''; $('#route-preview').classList.add('hidden');
+async function sendTask(prompt, options = {}) { const attachKey = options.sessionId ? 'followup' : options.phone ? 'phone' : 'new', files = attached[attachKey]; if (files.some(f => f.status === 'uploading')) { showFeedback('Wait for the files to finish uploading.'); return false; } if (!prompt.trim() && !files.length) return; const button = options.sessionId ? $('#followup-send') : $('#send-button'); button.disabled = true; try { const selectedProject = $('#project-select').value; const isNew = !options.sessionId; if (files.some(f => f.status === 'failed')) throw new Error('Remove the files that failed to upload, then send again.'); const {task} = await api('/api/tasks', { method:'POST', body:JSON.stringify({ prompt, harness:options.harness || $('#harness-select').value, model:options.model ?? (options.sessionId ? $('#followup-model').value : $('#model-select').value), cwd:options.cwd ?? (selectedProject === '__new__' ? '' : selectedProject), newWorkspace:isNew && selectedProject === '__new__' ? $('#new-workspace').value : '', newSession:isNew, sessionId:options.sessionId || null, followup:options.followup || 'auto', attachments:files.map(f => f.id), skipPermissions:options.sessionId ? $('#followup-skip').checked : $('#skip-permissions').checked, agentName:isNew && !options.phone ? $('#agent-name').value.trim() : '', account:isNew && !options.phone && !$('#account-wrap').classList.contains('hidden') ? $('#account-select').value : '' }) }); attached[attachKey] = []; renderAttachments(attachKey); $('#prompt').value = ''; if (isNew && !options.phone) $('#agent-name').value = ''; $('#followup-prompt').value = ''; $('#followup-prompt').style.height = ''; state.followupPreviewKey = null; $('#followup-preview').classList.add('hidden'); $('#new-workspace').value = ''; $('#route-preview').classList.add('hidden');
   if (options.sessionId && !task.handoffFrom) { state.pending.push({ taskId:task.id, sessionId:options.sessionId, text:prompt.trim(), at:Date.now() }); state.pinBottom = true; await refresh(); return true; }
   state.followTask = task.id; await refresh(); openTask(task.id); return true; } catch (error) { showFeedback(error.message); return false; } finally { button.disabled = false; } }
 // The conversation stays pinned to its newest message until the person scrolls up, and re-pins at the bottom.
@@ -654,6 +654,83 @@ $('#notify-test').addEventListener('click', async () => {
   await api('/api/push/subscribe', { method:'POST', body:JSON.stringify({ subscription:sub.toJSON(), label:isIOS ? 'iPhone' : 'Browser' }) }).catch(error => showFeedback(error.message));
 });
 ['notify-finished', 'notify-asking'].forEach(id => $(`#${id}`).addEventListener('change', () => api('/api/push/prefs', { method:'POST', body:JSON.stringify({ finished:$('#notify-finished').checked, asking:$('#notify-asking').checked }) }).catch(error => showFeedback(error.message))));
+const agentStates = { off:'Off', new:'Not started', asleep:'Asleep', open:'Finishing', working:'Working', asking:'Needs your OK' };
+async function loadAgents() {
+  try {
+    const { agents } = await api('/api/agents');
+    $('#agent-list').innerHTML = agents.map(a => `<div class="device-row"><div><b>${escapeHtml(a.name)} <span class="device-tag">${escapeHtml(agentStates[a.state] || a.state)}</span></b><small>${escapeHtml(harnessNames[a.harness] || a.harness)} · ${escapeHtml(projectName(a.cwd))} · ${escapeHtml(a.memoryFile.slice(a.cwd.length + 1))}</small></div><div class="device-actions">${a.sessionId ? `<button class="pill" data-agent-open="${escapeHtml(a.sessionId)}" type="button">Open</button>` : ''}<select data-agent-critic="${escapeHtml(a.id)}" aria-label="Critic for ${escapeHtml(a.name)}"><option value="default"${a.critic === null ? ' selected' : ''}>Critic: default</option><option value="on"${a.critic === true ? ' selected' : ''}>Critic: on</option><option value="off"${a.critic === false ? ' selected' : ''}>Critic: off</option></select><button class="pill" data-agent-toggle="${escapeHtml(a.id)}" data-to="${a.enabled ? 'off' : 'on'}" type="button">${a.enabled ? 'Turn off' : 'Turn on'}</button><button class="pill" data-agent-delete="${escapeHtml(a.id)}" type="button">Delete</button></div></div>`).join('') || '<p class="settings-note">No agents yet. Type an agent name when you start a new session.</p>';
+  } catch {}
+}
+$('#agent-list').addEventListener('click', async e => {
+  const open = e.target.closest('[data-agent-open]'), toggle = e.target.closest('[data-agent-toggle]'), remove = e.target.closest('[data-agent-delete]');
+  if (open) return openSession(open.dataset.agentOpen);
+  try {
+    if (toggle) await api(`/api/agents/${encodeURIComponent(toggle.dataset.agentToggle)}/${toggle.dataset.to}`, { method:'POST' });
+    if (remove) await api(`/api/agents/${encodeURIComponent(remove.dataset.agentDelete)}/delete`, { method:'POST' });
+  } catch (error) { showFeedback(error.message); }
+  loadAgents();
+});
+// Accounts: the Settings list, and the composer's selector (only the chosen harness's accounts, and only when it has more than one).
+let accountList = [];
+function renderAccountChoices() {
+  const harness = $('#harness-select').value, mine = accountList.filter(a => a.harness === harness), select = $('#account-select'), current = select.value;
+  setOptions(select, mine.map(a => `<option value="${escapeHtml(a.id)}">${escapeHtml(a.name === 'default' ? 'Default account' : a.name)}${a.loggedIn ? '' : ' · sign in'}</option>`).join(''));
+  if (mine.some(a => a.id === current)) select.value = current;
+  $('#account-wrap').classList.toggle('hidden', mine.length < 2);
+}
+async function loadAccounts() {
+  try {
+    const data = await api('/api/accounts');
+    accountList = data.accounts;
+    const local = Boolean(state.local);
+    $('#account-list').innerHTML = accountList.map(a => `<div class="device-row"><div><b>${escapeHtml(a.name === 'default' ? 'Default' : a.name)} <span class="device-tag">${a.loggedIn ? 'Signed in' : 'Signed out'}</span></b><small>${escapeHtml(harnessNames[a.harness] || a.harness)} · ${escapeHtml(a.alias)}</small></div><div class="device-actions">${local ? `<button class="pill" data-account-login="${escapeHtml(a.id)}" type="button">Sign in</button>${a.name === 'default' ? '' : `<button class="pill" data-account-remove="${escapeHtml(a.id)}" type="button">Remove</button>`}` : ''}</div></div>`).join('');
+    $('#account-form').classList.toggle('hidden', !local);
+    $('#account-source').textContent = data.sourceLine;
+    $('#account-zshrc').classList.toggle('hidden', !local || data.inZshrc);
+    renderAccountChoices();
+  } catch {}
+}
+const accountFeedback = text => { const el = $('#account-feedback'); el.textContent = text; el.classList.toggle('hidden', !text); };
+$('#account-list').addEventListener('click', async e => {
+  const login = e.target.closest('[data-account-login]'), remove = e.target.closest('[data-account-remove]');
+  try {
+    if (login) { await api(`/api/accounts/${encodeURIComponent(login.dataset.accountLogin)}/login`, { method:'POST' }); accountFeedback('A Terminal window opened on the Mac. Finish signing in there.'); }
+    if (remove) await api(`/api/accounts/${encodeURIComponent(remove.dataset.accountRemove)}/delete`, { method:'POST' });
+  } catch (error) { accountFeedback(error.message); }
+  loadAccounts();
+});
+$('#account-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  try {
+    await api('/api/accounts', { method:'POST', body:JSON.stringify({ harness:$('#account-harness').value, name:$('#account-name').value.trim() }) });
+    $('#account-name').value = ''; accountFeedback('A Terminal window opened on the Mac. Finish signing in there.');
+  } catch (error) { accountFeedback(error.message); }
+  loadAccounts();
+});
+$('#account-zshrc').addEventListener('click', async () => {
+  try { const { added } = await api('/api/accounts/zshrc', { method:'POST' }); accountFeedback(added ? 'Added to ~/.zshrc. Open a new Terminal window to use the commands.' : 'That line is already in ~/.zshrc.'); } catch (error) { accountFeedback(error.message); }
+  loadAccounts();
+});
+async function loadPhoneAccess(refresh = false) {
+  try {
+    const { mode, canChange, tailscale } = await api(`/api/phone-access${refresh ? '?refresh=1' : ''}`);
+    $$('input[name="phone-access"]').forEach(input => { input.checked = input.value === mode; input.disabled = !canChange; });
+    $('#tailscale-status').textContent = tailscale.url ? `Tailscale address: ${tailscale.url}. Your phone needs the Tailscale app, signed in to the same tailnet, with the VPN on.`
+      : tailscale.problem || (canChange ? 'Tailscale is ready. Choose it to publish Shed to your tailnet only.' : 'Choose how phones connect from Shed on the Mac.');
+    if (mode === 'tailscale') $('#remote-note').textContent = 'This Tailscale address does not change. On the same Wi-Fi, you can also use:';
+  } catch {}
+}
+$$('input[name="phone-access"]').forEach(input => input.addEventListener('change', async () => {
+  $('#tailscale-status').textContent = input.value === 'tailscale' ? 'Publishing Shed to your tailnet…' : 'Switching back to the Cloudflare link…';
+  try { await api('/api/phone-access', { method:'POST', body:JSON.stringify({ mode:input.value }) }); } catch (error) { showFeedback(error.message); }
+  await loadPhoneAccess(true);
+  try { Object.assign(state, await api('/api/me')); renderHarnesses(); } catch {}
+  loadConnect();
+}));
+async function loadCritic() { try { const { prefs } = await api('/api/critic'); $('#critic-enabled').checked = prefs.enabled; $('#critic-harness').value = prefs.harness; $('#critic-rounds').value = prefs.rounds; } catch { /* Settings still work without it. */ } }
+const saveCritic = () => api('/api/critic', { method:'POST', body:JSON.stringify({ enabled:$('#critic-enabled').checked, harness:$('#critic-harness').value, rounds:Number($('#critic-rounds').value) }) }).then(loadCritic).catch(error => showFeedback(error.message));
+['critic-enabled', 'critic-harness', 'critic-rounds'].forEach(id => $(`#${id}`).addEventListener('change', saveCritic));
+$('#agent-list').addEventListener('change', e => { const pick = e.target.closest('[data-agent-critic]'); if (pick) api(`/api/agents/${encodeURIComponent(pick.dataset.agentCritic)}/critic`, { method:'POST', body:JSON.stringify({ mode:pick.value }) }).catch(error => showFeedback(error.message)); });
 async function loadAutoClose() { try { const { prefs } = await api('/api/autoclose'); $('#autoclose-enabled').checked = prefs.enabled; } catch { /* Settings still work without it. */ } }
 $('#autoclose-enabled').addEventListener('change', () => api('/api/autoclose', { method:'POST', body:JSON.stringify({ enabled:$('#autoclose-enabled').checked }) }).catch(error => showFeedback(error.message)));
 const HARNESS_NAMES = { codex:'Codex', claude:'Claude Code', gemini:'Gemini', pi:'Pi', opencode:'OpenCode' };
@@ -1027,7 +1104,7 @@ $('#harness-list').addEventListener('click', e => {
   $('#prompt').focus({ preventScroll:true });
 });
 function toggleSkipPermissions() { $('#skip-wrap').classList.toggle('hidden', !['auto', 'claude', 'codex'].includes($('#harness-select').value)); }
-$('#harness-select').addEventListener('change', () => { renderModelChoices(); toggleSkipPermissions(); previewRoute(); }); $('#model-select').addEventListener('change', previewRoute); $('#project-select').addEventListener('change', () => { toggleNewWorkspace(); previewRoute(); }); $('#new-workspace').addEventListener('input', previewRoute);
+$('#harness-select').addEventListener('change', () => { renderAccountChoices(); renderModelChoices(); toggleSkipPermissions(); previewRoute(); }); $('#model-select').addEventListener('change', previewRoute); $('#project-select').addEventListener('change', () => { toggleNewWorkspace(); previewRoute(); }); $('#new-workspace').addEventListener('input', previewRoute);
 $('#send-button').addEventListener('click', () => sendTask($('#prompt').value));
 $('#prompt').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); sendTask($('#prompt').value); } });
 // Runs the same local Laya decision a send would, so the drawer can say where a follow-up will go before it is sent.
@@ -1130,13 +1207,13 @@ async function loadConnect() {
     const data = await api('/api/connect');
     if (!data.url) {
       $('#connect-qr').innerHTML = ''; $('#connect-card').classList.add('hidden');
-      $('#connect-url').textContent = ''; $('#connect-note').textContent = 'The secure link is not running right now, so a phone cannot connect. It starts automatically with the Mac; check that the Mac is online.';
+      $('#connect-url').textContent = ''; $('#connect-note').textContent = data.problem || 'The secure link is not running right now, so a phone cannot connect. It starts automatically with the Mac; check that the Mac is online.';
       return;
     }
     $('#connect-qr').innerHTML = data.qr; $('#connect-card-qr').innerHTML = data.qr;
     $('#connect-url').textContent = data.url; $('#connect-url').href = data.url;
     $('#connect-url').textContent = data.link || data.url; $('#connect-url').href = data.url;
-    $('#connect-note').textContent = data.secure ? 'This code signs your phone in as a trusted device for the next 10 minutes. The link itself still asks for your password, and other devices need your approval on this Mac.' : 'The secure link is not running, so this address only works on the same Wi-Fi as the Mac, over plain http.';
+    $('#connect-note').textContent = data.via === 'tailscale' && data.secure ? 'Turn on the Tailscale app on your phone first (same tailnet as this Mac). This code then signs your phone in as a trusted device for the next 10 minutes. Other devices need your approval on this Mac.' : data.secure ? 'This code signs your phone in as a trusted device for the next 10 minutes. The link itself still asks for your password, and other devices need your approval on this Mac.' : 'The secure link is not running, so this address only works on the same Wi-Fi as the Mac, over plain http.';
     $('#connect-card').classList.toggle('hidden', Boolean(data.phoneConnectedAt));
   } catch {}
 }

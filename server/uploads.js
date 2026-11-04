@@ -95,7 +95,7 @@ export function uploadStore(dataDir) {
 }
 
 // Adds .shed/ to the repository's local exclude list (never to its .gitignore), so uploads are not committed.
-function ignoreInGit(cwd) {
+export function ignoreInGit(cwd) {
   const exclude = path.join(cwd, '.git', 'info', 'exclude');
   if (!fs.existsSync(path.join(cwd, '.git'))) return;
   try {

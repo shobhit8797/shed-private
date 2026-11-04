@@ -30,6 +30,16 @@ The free tunnel's address changes whenever it restarts, which breaks the Home Sc
 
 Once you have a licence key, turn it on by pasting it under **Settings → Permanent address** on the Mac. Shed asks the relay (`site/api/relay.js`) for a Cloudflare named tunnel and saves its token in `.jev-data/relay.json`. `server/tunnel.js` then switches from the Quick Tunnel to that tunnel. Traffic goes from Cloudflare straight to your Mac; the relay only manages the tunnel, and your password and device approval still apply.
 
+## Phone access with Tailscale
+
+Phones can reach Shed through Tailscale instead of the Cloudflare link. Choose **Tailscale** under **Settings → Phone access** on the Mac. Shed runs `tailscale serve --bg --https=8443 http://127.0.0.1:<port>`, which publishes Shed to your tailnet only (never Funnel) at `https://<mac>.<tailnet>.ts.net:8443`. The QR code then carries that address, and `server/tunnel.js` stops the public Cloudflare link while Tailscale is chosen. Choose **Cloudflare link** to go back. Shed then removes only its own handler on port 8443.
+
+- **Direct connection:** a phone with the Tailscale app on connects to the Mac over WireGuard. When the networks block a direct path, traffic goes through Tailscale's relays, still encrypted end to end.
+- **Stable address:** the address does not change, so the Home Screen app and its notifications keep working.
+- **Requirements:** Tailscale signed in on the Mac and the phone (same tailnet), MagicDNS and HTTPS Certificates turned on in the Tailscale admin console. Shed refuses a port that already serves something else, or one with Funnel on.
+- **Sign-in still applies:** requests through Tailscale Serve never count as "on the Mac", so the password and device approval apply as they do for the Cloudflare link.
+- **One Shed per Mac name:** browsers send a cookie to every port of a host. Any other service that you publish with `tailscale serve` on the same `<mac>.<tailnet>.ts.net` name receives Shed's sign-in cookie. Do not publish a service you do not trust on that name.
+
 ## Open it
 
 The server starts automatically when this Mac signs in. Open `http://localhost:4378` on the Mac once and choose **Set a password for the first time**. From any Wi-Fi or cellular network, use the HTTPS address shown under **Settings → Phone access** and sign in with that password.
@@ -65,6 +75,37 @@ The command center's **New session** composer does not require an existing agent
 3. Choose an existing project, use the task plane workspace, or create a new named workspace under `~/Shed Workspaces`.
 4. Start the session and watch its output in Activity and Live sessions.
 
+## Agents
+
+An agent is a named, lasting session in one project, on Claude Code or Codex. Type a name in **Agent name** when you start a new session. Each later message to that agent's session continues the same conversation.
+
+- **Runs only while it works:** Shed starts the agent in a Terminal window when a message comes in. When it has no Shed task, is not asking for permission, and has been idle for 30 seconds, Shed ends it and closes its tab. The session ID stays with the agent, so the next message resumes the same conversation (`claude --resume`, `codex resume`).
+- **Decisions file:** each agent writes its decisions to `<project>/.shed/agents/<name>.md` (kept out of git through `.git/info/exclude`). Its standing instructions tell it to add a short entry after each task and to read the file only when it needs earlier context, so the file does not fill the context window. Claude gets them through `--append-system-prompt`, Codex through `-c developer_instructions=…`.
+- **Compaction:** Claude agents start with `--autocompact auto`. Codex compacts with its own default limit.
+- **Identity:** a Claude agent's session ID comes from Shed (`--session-id`), and its window shows the agent's name (`--name`). Shed links a Codex agent to its session once Codex reports the ID.
+- **Settings → Agents** lists every agent with its state (asleep, working, needs your OK, off). **Turn off** refuses new messages. **Delete** forgets the agent but keeps its conversation and its decisions file. An agent made again with the same name in the same project reuses that file.
+
+Agents are stored in `.jev-data/agents.json`.
+
+## Accounts
+
+Sign in to several Claude Code and Codex accounts on one Mac. Add them under Settings → Accounts, then pick one in the new-session composer or when you create an agent. A session and an agent keep their account.
+
+- Each added account keeps its folder in `~/.shed/accounts/<harness>/<name>`. Claude Code reads it through `CLAUDE_CONFIG_DIR` and Codex through `CODEX_HOME`. Shed sets the variable on the command it opens, never for your whole Mac.
+- The normal `~/.claude` and `~/.codex` folders are the `default` accounts and behave as before.
+- Each account gets a Terminal alias, such as `claude-work` or `codex-personal`, in `~/.shed/accounts/aliases.sh`. Settings has a button that adds `source ~/.shed/accounts/aliases.sh` to `~/.zshrc` once. Shed never edits `~/.zshrc` otherwise.
+- Remove forgets an account but keeps its folder and transcripts.
+- API: `GET /api/accounts`, `POST /api/accounts` (`{ harness, name }`), `POST /api/accounts/<id>/login` and `/delete`. Changes work only from the Mac. `POST /api/tasks` takes an optional `account`.
+
+## Critic
+
+A second agent can question the first one. Turn it on under **Settings → Critic** (off by default). Choose the critic's harness (by default the other one: Codex reviews Claude, Claude reviews Codex) and the review rounds for each task (2 by default, 0 to 5). **Settings → Agents** has a Critic switch for each agent (default, on or off) that beats the setting.
+
+- **The critic is an agent named `critic`**, one per project, made on first need, with its own decisions file. It starts read-only: Claude with `--permission-mode plan`, Codex with `-s read-only`.
+- **During a task**, the worker is told to run `shed ask critic "..."` before an architecture decision and before a large implementation step. `shed ask critic` finds the critic of the caller's project.
+- **After a task** that Shed ran completes, Shed sends the critic the prompt, the worker's final reply, `git diff --stat` and a size-limited `git diff` (git projects only). The critic answers with numbered concerns or exactly `No concerns.` Concerns go to the worker, which must fix each one or reject it with a reason. This repeats until `No concerns.` or the round limit.
+- **Visible in Between sessions**, on the page and on the phone. A worker is not put to sleep while a review waits on it. The critic never reviews itself, and a turned-off agent starts no rounds.
+
 ## Live sessions
 
 The **Live sessions** section identifies conversations held open by running harness processes. Codex transcripts are linked to their owning process directly. OpenCode can also provide busy state through its [local session API](https://dev.opencode.ai/docs/server/). The drawer refreshes every five seconds. Follow-ups to an open Codex session use `codex queue` so the task plane does not try to acquire a second writer for the same thread. A queued message stays marked **QUEUED** until Codex records the turn in that conversation. Queue acceptance alone does not mean the owning Codex process has started the turn; check the original conversation if it stays queued. Other harnesses accept follow-ups after their current turn finishes.
@@ -87,7 +128,7 @@ Tasks follow the session transcript and finish when Claude goes idle or Codex re
 
 Anyone who can reach your agents can run code on your Mac, so Shed needs both your password and a device you approved.
 
-- **Only the secure link reaches Shed.** Shed listens on this Mac only; phones connect through the https tunnel. Plain-http access over Wi-Fi is off unless you start Shed with `SHED_LAN=1`.
+- **Only the secure link reaches Shed.** Shed listens on this Mac only; phones connect through the https tunnel or through Tailscale Serve. A request counts as "on the Mac" only when it comes over loopback, is addressed to `localhost`, and carries no tunnel or Tailscale headers. Plain-http access over Wi-Fi is off unless you start Shed with `SHED_LAN=1`.
 - **Every device is approved on the Mac.** A sign-in from outside the Mac waits until you click **Approve** on the Mac, and your other devices get a notification about it. Scanning the QR code on the Mac skips the wait: it carries a one-time pairing code that expires after 10 minutes. Approving is only possible on the Mac, so a stolen phone session cannot let in more devices.
 - **Each device has its own key.** Sign-ins get a random session key, stored only as a hash and expired after 30 idle days. **Settings → Devices** lists every device, with **Sign out** for each and **Sign out all other devices**.
 - **Sign-in attempts are limited** per visitor (using Cloudflare's report of the real address) and in total per hour. After 20 failures in an hour, you get a notification.
